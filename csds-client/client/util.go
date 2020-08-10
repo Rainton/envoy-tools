@@ -204,7 +204,7 @@ func printOutResponse(response *csdspb.ClientStatusResponse, info Flag) error {
 		fmt.Printf("No xDS clients connected.\n")
 		return nil
 	} else {
-		fmt.Printf("%-50s %-30s %-30s \n", "Client ID", "xDS stream type", "Config Status")
+		fmt.Printf("%-70s %-30s %-30s \n", "Client ID", "xDS stream type", "Config Status")
 	}
 
 	var hasXdsConfig bool
@@ -220,12 +220,14 @@ func printOutResponse(response *csdspb.ClientStatusResponse, info Flag) error {
 			// the stream type of the connected client in the response.
 			if metadata["XDS_STREAM_TYPE"] != nil {
 				xdsType = metadata["XDS_STREAM_TYPE"].(string)
+			} else if metadata["TRAFFIC_DIRECTOR_XDS_STREAM_TYPE"] != nil {
+				xdsType = metadata["TRAFFIC_DIRECTOR_XDS_STREAM_TYPE"].(string)
 			}
 		}
 
 		if config.GetXdsConfig() == nil {
 			if config.GetNode() != nil {
-				fmt.Printf("%-50s %-30s %-30s \n", id, xdsType, "N/A")
+				fmt.Printf("%-70s %-30s %-30s \n", id, xdsType, "N/A")
 			}
 		} else {
 			hasXdsConfig = true
@@ -238,7 +240,7 @@ func printOutResponse(response *csdspb.ClientStatusResponse, info Flag) error {
 				if i == 0 {
 					fmt.Printf("%-30s \n", configStatus[i])
 				} else {
-					fmt.Printf("%-50s %-30s %-30s \n", "", "", configStatus[i])
+					fmt.Printf("%-70s %-30s %-30s \n", "", "", configStatus[i])
 				}
 			}
 			if len(configStatus) == 0 {
