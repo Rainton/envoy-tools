@@ -234,7 +234,7 @@ func printOutResponse(response *csdspb.ClientStatusResponse, info Flag) error {
 
 			// parse config status
 			configStatus := parseConfigStatus(config.GetXdsConfig())
-			fmt.Printf("%-50s %-30s ", id, xdsType)
+			fmt.Printf("%-70s %-30s ", id, xdsType)
 
 			for i := 0; i < len(configStatus); i++ {
 				if i == 0 {
