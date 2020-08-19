@@ -1,31 +1,26 @@
-// Package client/v2 implements the client interface for v2 transport api version in specific
+// Package client/v2 implements the client interface for v2 transport api version
 package client
 
 import (
 	"context"
-	"crypto/x509"
 	"encoding/json"
 	"envoy-tools/csds-client/client"
+	clientUtil "envoy-tools/csds-client/client/util"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"path/filepath"
 	"strings"
 	"time"
 
 	csdspb_v2 "github.com/envoyproxy/go-control-plane/envoy/service/status/v2"
 	envoy_type_matcher_v2 "github.com/envoyproxy/go-control-plane/envoy/type/matcher"
-	"github.com/ghodss/yaml"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/oauth"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
 
-// ClientV2 implements the interface Client
+// ClientV2 implements the Client interface
 type ClientV2 struct {
 	clientConn *grpc.ClientConn
 	csdsClient csdspb_v2.ClientStatusDiscoveryServiceClient
@@ -34,6 +29,10 @@ type ClientV2 struct {
 	metadata    metadata.MD
 	opts        client.ClientOptions
 }
+
+// field keys in NodeMatcher
+const gcpProjectNumberKey string = "TRAFFICDIRECTOR_GCP_PROJECT_NUMBER"
+const gcpNetworkNameKey string = "TRAFFICDIRECTOR_NETWORK_NAME"
 
 // parseNodeMatcher parses the csds request yaml from -request_file and -request_yaml to nodematcher
 // if -request_file and -request_yaml are both set, the values in this yaml string will override and
@@ -50,10 +49,10 @@ func (c *ClientV2) parseNodeMatcher() error {
 
 	c.nodeMatcher = nodematchers
 
-	// check if required fields exist in nodematcher
+	// check if required fields exist in NodeMatcher
 	switch c.opts.Platform {
 	case "gcp":
-		keys := []string{"TRAFFICDIRECTOR_GCP_PROJECT_NUMBER", "TRAFFICDIRECTOR_NETWORK_NAME"}
+		keys := []string{gcpProjectNumberKey, gcpNetworkNameKey}
 		for _, key := range keys {
 			if value := getValueByKeyFromNodeMatcher(c.nodeMatcher, key); value == "" {
 				return fmt.Errorf("missing field %v in NodeMatcher", key)
@@ -68,58 +67,23 @@ func (c *ClientV2) parseNodeMatcher() error {
 
 // connWithAuth connects to uri with authentication
 func (c *ClientV2) connWithAuth() error {
-	var scope string
+	var err error
 	switch c.opts.AuthnMode {
 	case "jwt":
-		if c.opts.Jwt == "" {
-			return errors.New("missing jwt file")
+		c.clientConn, err = clientUtil.ConnWithJwt(c.opts)
+		if err != nil {
+			return err
 		}
-		switch c.opts.Platform {
-		case "gcp":
-			scope = "https://www.googleapis.com/auth/cloud-platform"
-			pool, err := x509.SystemCertPool()
-			if err != nil {
-				return err
-			}
-			creds := credentials.NewClientTLSFromCert(pool, "")
-			perRPC, err := oauth.NewServiceAccountFromFile(c.opts.Jwt, scope)
-			if err != nil {
-				return err
-			}
-
-			c.clientConn, err = grpc.Dial(c.opts.Uri, grpc.WithTransportCredentials(creds), grpc.WithPerRPCCredentials(perRPC))
-			if err != nil {
-				return err
-			}
-			return nil
-		default:
-			return fmt.Errorf("%s platform is not supported, list of supported platforms: gcp", c.opts.Platform)
-		}
+		return nil
 	case "auto":
 		switch c.opts.Platform {
 		case "gcp":
-			scope = "https://www.googleapis.com/auth/cloud-platform"
-			pool, err := x509.SystemCertPool()
-			if err != nil {
-				return err
-			}
-			creds := credentials.NewClientTLSFromCert(pool, "")
-			perRPC, err := oauth.NewApplicationDefault(context.Background(), scope) // Application Default Credentials (ADC)
-			if err != nil {
-				return err
-			}
-
 			// parse GCP project number as header for authentication
-			var key string
-			switch c.opts.Uri {
-			case "trafficdirector.googleapis.com:443":
-				key = "TRAFFICDIRECTOR_GCP_PROJECT_NUMBER"
-			}
-			if projectNum := getValueByKeyFromNodeMatcher(c.nodeMatcher, key); projectNum != "" {
+			if projectNum := getValueByKeyFromNodeMatcher(c.nodeMatcher, gcpProjectNumberKey); projectNum != "" {
 				c.metadata = metadata.Pairs("x-goog-user-project", projectNum)
 			}
 
-			c.clientConn, err = grpc.Dial(c.opts.Uri, grpc.WithTransportCredentials(creds), grpc.WithPerRPCCredentials(perRPC))
+			c.clientConn, err = clientUtil.ConnWithAutoGcp(c.opts)
 			if err != nil {
 				return err
 			}
@@ -194,7 +158,7 @@ func (c *ClientV2) Run() error {
 	}
 }
 
-// doRequest sends request and print out the parsed response
+// doRequest sends request and prints out the parsed response
 func (c *ClientV2) doRequest(streamClientStatus csdspb_v2.ClientStatusDiscoveryService_StreamClientStatusClient) error {
 
 	req := &csdspb_v2.ClientStatusRequest{NodeMatchers: c.nodeMatcher}
@@ -286,33 +250,18 @@ func printOutResponse(response *csdspb_v2.ClientStatusResponse, opts client.Clie
 	}
 
 	if hasXdsConfig {
-		if err := client.PrintDetailedConfig(response, opts); err != nil {
+		if err := clientUtil.PrintDetailedConfig(response, opts); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// parseYaml is a helper method for parsing csds request yaml to nodematchers
+// parseYaml is a helper method for parsing csds request yaml to NodeMatchers
 func parseYaml(path string, yamlStr string, nms *[]*envoy_type_matcher_v2.NodeMatcher) error {
 	if path != "" {
-		// parse yaml to json
-		filename, err := filepath.Abs(path)
+		data, err := clientUtil.ParseYamlFileToMap(path)
 		if err != nil {
-			return err
-		}
-		yamlFile, err := ioutil.ReadFile(filename)
-		if err != nil {
-			return err
-		}
-		js, err := yaml.YAMLToJSON(yamlFile)
-		if err != nil {
-			return err
-		}
-
-		// parse the json array to a map to iterate it
-		var data map[string]interface{}
-		if err = json.Unmarshal(js, &data); err != nil {
 			return err
 		}
 
@@ -331,22 +280,8 @@ func parseYaml(path string, yamlStr string, nms *[]*envoy_type_matcher_v2.NodeMa
 		}
 	}
 	if yamlStr != "" {
-		var js []byte
-		var err error
-		// json input
-		if client.IsJson(yamlStr) {
-			js = []byte(yamlStr)
-		} else {
-			// parse the yaml input into json
-			js, err = yaml.YAMLToJSON([]byte(yamlStr))
-			if err != nil {
-				return err
-			}
-		}
-
-		// parse the json array to a map to iterate it
-		var data map[string]interface{}
-		if err = json.Unmarshal(js, &data); err != nil {
+		data, err := clientUtil.ParseYamlStrToMap(yamlStr)
+		if err != nil {
 			return err
 		}
 

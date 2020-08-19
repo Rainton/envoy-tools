@@ -1,12 +1,19 @@
-package client
+package util
 
 import (
 	"bytes"
+	"context"
+	"crypto/x509"
 	"encoding/json"
+	"envoy-tools/csds-client/client"
+	"errors"
 	"fmt"
+	"github.com/ghodss/yaml"
 	"io"
+	"io/ioutil"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 
@@ -14,12 +21,16 @@ import (
 	"github.com/emirpasic/gods/sets/treeset"
 	envoy_api_v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	envoy_config_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	envoy_config_endpoint_v3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	envoy_config_filter_http_router_v2 "github.com/envoyproxy/go-control-plane/envoy/config/filter/http/router/v2"
 	envoy_config_filter_network_http_connection_manager_v2 "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/http_connection_manager/v2"
 	envoy_config_listener_v3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	envoy_config_route_v3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	envoy_extensions_filters_http_router_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	envoy_extensions_filters_network_http_connection_manager_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/oauth"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -84,6 +95,9 @@ func (r *TypeResolver) FindMessageByURL(url string) (protoreflect.MessageType, e
 	case "type.googleapis.com/envoy.config.route.v3.RouteConfiguration":
 		routeConfiguration := envoy_config_route_v3.RouteConfiguration{}
 		return routeConfiguration.ProtoReflect().Type(), nil
+	case "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment":
+		clusterLoadAssignment := envoy_config_endpoint_v3.ClusterLoadAssignment{}
+		return clusterLoadAssignment.ProtoReflect().Type(), nil
 	default:
 		return nil, protoregistry.NotFound
 	}
@@ -145,8 +159,10 @@ func ParseXdsRelationship(js []byte) (GraphData, error) {
 	lds := make(map[string]string)
 	rds := make(map[string]string)
 	cds := make(map[string]string)
+	eds := make(map[string]string)
 	ldsToRds := make(map[string]*treeset.Set)
 	rdsToCds := make(map[string]*treeset.Set)
+	cdsToEds := make(map[string]*treeset.Set)
 
 	for _, config := range data["config"].([]interface{}) {
 		configMap := config.(map[string]interface{})
@@ -208,14 +224,30 @@ func ParseXdsRelationship(js []byte) (GraphData, error) {
 							cds[name] = id
 						}
 					}
+				case "endpointConfig":
+					for _, endpoints := range value.(map[string]interface{}) {
+						for idx, endpoint := range endpoints.([]interface{}) {
+							id := "EDS" + strconv.Itoa(idx)
+							eds[id] = id
+
+							clusterName := endpoint.(map[string]interface{})["endpointConfig"].(map[string]interface{})["clusterName"].(string)
+							if cdsSet, ok := cdsToEds[clusterName]; ok {
+								cdsSet.Add(id)
+							} else {
+								cdsSet = treeset.NewWithStringComparator()
+								cdsSet.Add(id)
+								cdsToEds[clusterName] = cdsSet
+							}
+						}
+					}
 				}
 			}
 		}
 	}
 
 	gData := GraphData{
-		nodes:     []map[string]string{lds, rds, cds},
-		relations: []map[string]*treeset.Set{ldsToRds, rdsToCds},
+		nodes:     []map[string]string{lds, rds, cds, eds},
+		relations: []map[string]*treeset.Set{ldsToRds, rdsToCds, cdsToEds},
 	}
 
 	return gData, nil
@@ -237,7 +269,7 @@ func GenerateGraph(data GraphData) (string, error) {
 	}
 
 	// different colors for xDS nodes
-	colors := map[string]string{"LDS": "#4285F4", "RDS": "#FBBC04", "CDS": "#34A853"}
+	colors := map[string]string{"LDS": "#4285F4", "RDS": "#EA4335", "CDS": "#FBBC04", "EDS": "#34A853"}
 
 	for _, xDS := range data.nodes {
 		for name, node := range xDS {
@@ -279,7 +311,7 @@ func OpenBrowser(url string) error {
 }
 
 // PrintDetailedConfig prints out the detailed xDS config and calls visualize() if it is enabled
-func PrintDetailedConfig(response proto.Message, opts ClientOptions) error {
+func PrintDetailedConfig(response proto.Message, opts client.ClientOptions) error {
 	// parse response to json
 	// format the json and resolve google.protobuf.Any types
 	m := protojson.MarshalOptions{Multiline: true, Indent: "  ", Resolver: &TypeResolver{}}
@@ -313,4 +345,99 @@ func PrintDetailedConfig(response proto.Message, opts ClientOptions) error {
 		}
 	}
 	return nil
+}
+
+// ConnWithJwt connects to uri with jwt authentication
+func ConnWithJwt(opts client.ClientOptions) (*grpc.ClientConn, error) {
+	if opts.Jwt == "" {
+		return nil, errors.New("missing jwt file")
+	}
+	switch opts.Platform {
+	case "gcp":
+		scope := "https://www.googleapis.com/auth/cloud-platform"
+		pool, err := x509.SystemCertPool()
+		if err != nil {
+			return nil, err
+		}
+		creds := credentials.NewClientTLSFromCert(pool, "")
+		perRPC, err := oauth.NewServiceAccountFromFile(opts.Jwt, scope)
+		if err != nil {
+			return nil, err
+		}
+
+		clientConn, err := grpc.Dial(opts.Uri, grpc.WithTransportCredentials(creds), grpc.WithPerRPCCredentials(perRPC))
+		if err != nil {
+			return nil, err
+		}
+		return clientConn, nil
+	default:
+		return nil, fmt.Errorf("%s platform is not supported, list of supported platforms: gcp", opts.Platform)
+	}
+}
+
+// ConnWithAutoGcp connects to uri on gcp with auto authentication
+func ConnWithAutoGcp(opts client.ClientOptions) (*grpc.ClientConn, error) {
+	scope := "https://www.googleapis.com/auth/cloud-platform"
+	pool, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, err
+	}
+	creds := credentials.NewClientTLSFromCert(pool, "")
+	perRPC, err := oauth.NewApplicationDefault(context.Background(), scope) // Application Default Credentials (ADC)
+	if err != nil {
+		return nil, err
+	}
+
+	clientConn, err := grpc.Dial(opts.Uri, grpc.WithTransportCredentials(creds), grpc.WithPerRPCCredentials(perRPC))
+	if err != nil {
+		return nil, err
+	}
+	return clientConn, nil
+}
+
+// ParseYamlFileToMap parses yaml file to map
+func ParseYamlFileToMap(path string) (map[string]interface{}, error) {
+	// parse yaml to json
+	filename, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	yamlFile, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	js, err := yaml.YAMLToJSON(yamlFile)
+	if err != nil {
+		return nil, err
+	}
+
+	// parse the json array to a map to iterate it
+	var data map[string]interface{}
+	if err = json.Unmarshal(js, &data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// ParseYamlStrToMap parses yaml string to map
+func ParseYamlStrToMap(yamlStr string) (map[string]interface{}, error) {
+	var js []byte
+	var err error
+	// json input
+	if IsJson(yamlStr) {
+		js = []byte(yamlStr)
+	} else {
+		// parse the yaml input into json
+		js, err = yaml.YAMLToJSON([]byte(yamlStr))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// parse the json array to a map to iterate it
+	var data map[string]interface{}
+	if err = json.Unmarshal(js, &data); err != nil {
+		return nil, err
+	}
+	return data, nil
 }
